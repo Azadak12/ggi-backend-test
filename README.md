@@ -8,8 +8,12 @@ frontend and an admin dashboard on top.
 
 ## Live demo
 
-- App: _(filled in after deploy)_
-- API: _(filled in after deploy)_ — Swagger docs at `/docs`
+- App: https://ggi-backend-test-web.onrender.com
+- API: https://ggi-backend-test-api.onrender.com — Swagger docs at `/docs`
+
+Hosted on Render's free tier: the backend spins down after 15 minutes of
+inactivity and takes ~30–60s to wake up on the next request; the free
+Postgres database expires 30 days after creation.
 
 **Try it as:**
 - Admin — pick "Admin" in the user switcher, password `Admin123!`

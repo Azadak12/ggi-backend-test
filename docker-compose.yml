@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ggi-backend-test-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ggi
+      POSTGRES_PASSWORD: ggi
+      POSTGRES_DB: ggi_backend_test
+    ports:
+      - '5434:5432'
+    volumes:
+      - ggi_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ggi -d ggi_backend_test']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  ggi_pgdata:

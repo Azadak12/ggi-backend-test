@@ -1,0 +1,6 @@
+export enum MessageSource {
+  FREE_QUOTA = 'FREE_QUOTA',
+  SUBSCRIPTION_BUNDLE = 'SUBSCRIPTION_BUNDLE',
+}
+
+export const FREE_MESSAGES_PER_MONTH = 3;

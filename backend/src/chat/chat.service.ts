@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { ChatMessage } from './domain/chat-message.entity';
 import { MonthlyUsage } from './domain/monthly-usage.entity';
 import { FREE_MESSAGES_PER_MONTH, MessageSource } from './domain/chat.enums';
@@ -20,48 +20,75 @@ export class ChatService {
     private readonly messages: Repository<ChatMessage>,
     @InjectRepository(MonthlyUsage)
     private readonly usage: Repository<MonthlyUsage>,
+    @InjectDataSource()
+    private readonly dataSource: DataSource,
     private readonly subscriptionsService: SubscriptionsService,
     private readonly openAi: OpenAiMockService,
   ) {}
 
+  /**
+   * The quota check-and-deduct step runs as its own short transaction, row
+   * locked, so two concurrent requests from the same user (double-click,
+   * two tabs) can't both read "quota available" before either has written —
+   * a classic lost-update race that would otherwise let a user with 1 free
+   * message left send 2 messages for the price of 1, or two concurrent
+   * requests both land on the same bundle credit. The (slow, mocked) AI
+   * call happens *after* this transaction commits, so we're not holding a
+   * DB row lock for the ~300-900ms of "thinking".
+   */
   async ask(
     userId: string,
     dto: AskQuestionDto,
   ): Promise<ChatMessage & { remainingFreeMessages: number }> {
     const monthKey = currentMonthKey();
-    let usageRow = await this.usage.findOne({
-      where: { userId, monthKey },
-    });
-    if (!usageRow) {
-      usageRow = await this.usage.save(
-        this.usage.create({
-          userId,
-          monthKey,
-          freeMessagesUsed: 0,
-        }),
-      );
-    }
 
-    let source: MessageSource;
-    let bundleId: string | null = null;
+    const { source, bundleId, remainingFreeMessages } =
+      await this.dataSource.transaction(async (manager) => {
+        const usageRepo = manager.getRepository(MonthlyUsage);
 
-    if (usageRow.freeMessagesUsed < FREE_MESSAGES_PER_MONTH) {
-      usageRow.freeMessagesUsed += 1;
-      await this.usage.save(usageRow);
-      source = MessageSource.FREE_QUOTA;
-    } else {
-      const bundle =
-        await this.subscriptionsService.findBundleForDeduction(userId);
-      if (!bundle) {
-        throw new QuotaExceededException({
-          freeMessagesUsed: usageRow.freeMessagesUsed,
-          freeMessagesLimit: FREE_MESSAGES_PER_MONTH,
+        // Ensure the row exists (no-op if a concurrent request just created
+        // it), then lock it — SELECT ... FOR UPDATE blocks until any other
+        // in-flight transaction for this same user+month has committed.
+        await usageRepo
+          .createQueryBuilder()
+          .insert()
+          .values({ userId, monthKey, freeMessagesUsed: 0 })
+          .orIgnore()
+          .execute();
+
+        const usageRow = await usageRepo.findOneOrFail({
+          where: { userId, monthKey },
+          lock: { mode: 'pessimistic_write' },
         });
-      }
-      await this.subscriptionsService.deductOne(bundle.id);
-      source = MessageSource.SUBSCRIPTION_BUNDLE;
-      bundleId = bundle.id;
-    }
+
+        if (usageRow.freeMessagesUsed < FREE_MESSAGES_PER_MONTH) {
+          usageRow.freeMessagesUsed += 1;
+          await usageRepo.save(usageRow);
+          return {
+            source: MessageSource.FREE_QUOTA,
+            bundleId: null as string | null,
+            remainingFreeMessages:
+              FREE_MESSAGES_PER_MONTH - usageRow.freeMessagesUsed,
+          };
+        }
+
+        const bundle = await this.subscriptionsService.deductForUsage(
+          manager,
+          userId,
+        );
+        if (!bundle) {
+          throw new QuotaExceededException({
+            freeMessagesUsed: usageRow.freeMessagesUsed,
+            freeMessagesLimit: FREE_MESSAGES_PER_MONTH,
+          });
+        }
+
+        return {
+          source: MessageSource.SUBSCRIPTION_BUNDLE,
+          bundleId: bundle.id,
+          remainingFreeMessages: 0,
+        };
+      });
 
     const completion = await this.openAi.complete(dto.question);
 
@@ -78,10 +105,7 @@ export class ChatService {
 
     return {
       ...saved,
-      remainingFreeMessages: Math.max(
-        0,
-        FREE_MESSAGES_PER_MONTH - usageRow.freeMessagesUsed,
-      ),
+      remainingFreeMessages: Math.max(0, remainingFreeMessages),
     };
   }
 

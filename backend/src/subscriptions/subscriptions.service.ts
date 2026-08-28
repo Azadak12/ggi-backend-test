@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { MoreThan, Repository } from 'typeorm';
+import { EntityManager, MoreThan, Repository } from 'typeorm';
 import { SubscriptionBundle } from './domain/subscription-bundle.entity';
 import { BillingHistory } from './domain/billing-history.entity';
 import { BillingEventType, BundleStatus } from './domain/subscription.enums';
@@ -161,41 +161,63 @@ export class SubscriptionsService {
   }
 
   /**
-   * Picks which of the user's active bundles to deduct a message from.
+   * Picks which of the user's active bundles to deduct a message from, and
+   * atomically deducts it. Must be called inside the caller's transaction
+   * (see ChatService.ask) so the whole "pick a bundle, then use it" flow is
+   * safe when the same user fires concurrent chat requests.
+   *
+   * The candidate list is read without a lock (cheap, and a stale ranking
+   * just means we might try a slightly-suboptimal bundle first, not a
+   * correctness bug). Each candidate is then row-locked with
+   * `SELECT ... FOR UPDATE` and re-checked *after* the lock is held, since a
+   * concurrent request may have exhausted it in between: if so, we move to
+   * the next-best candidate instead of over-deducting. This is what
+   * prevents two simultaneous requests from both reading "1 message left"
+   * and both proceeding as if they'd claimed it.
+   *
    * Interpretation of "the bundle with the latest remaining quota": the
-   * bundle currently holding the *largest* remaining balance is used first
+   * bundle currently holding the *largest* remaining balance is tried first
    * (unlimited/Enterprise counts as infinite), so a user is never left
    * burning through a small bundle while a roomier one sits untouched.
    */
-  async findBundleForDeduction(
+  async deductForUsage(
+    manager: EntityManager,
     userId: string,
   ): Promise<SubscriptionBundle | null> {
+    const bundleRepo = manager.getRepository(SubscriptionBundle);
     const now = new Date();
-    const active = await this.bundles.find({
+
+    const candidates = await bundleRepo.find({
       where: { userId, status: BundleStatus.ACTIVE, endDate: MoreThan(now) },
     });
 
-    const withQuota = active.filter(
-      (b) => b.remainingMessages === null || b.remainingMessages > 0,
-    );
-    if (withQuota.length === 0) return null;
+    const ranked = candidates
+      .filter((b) => b.remainingMessages === null || b.remainingMessages > 0)
+      .sort((a, b) => {
+        const aVal =
+          a.remainingMessages === null ? Infinity : a.remainingMessages;
+        const bVal =
+          b.remainingMessages === null ? Infinity : b.remainingMessages;
+        return bVal - aVal;
+      });
 
-    withQuota.sort((a, b) => {
-      const aVal =
-        a.remainingMessages === null ? Infinity : a.remainingMessages;
-      const bVal =
-        b.remainingMessages === null ? Infinity : b.remainingMessages;
-      return bVal - aVal;
-    });
+    for (const candidate of ranked) {
+      const locked = await bundleRepo.findOne({
+        where: { id: candidate.id },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!locked) continue;
+      if (locked.remainingMessages !== null && locked.remainingMessages <= 0) {
+        continue; // Lost the race for this one — try the next candidate.
+      }
 
-    return withQuota[0];
-  }
-
-  async deductOne(bundleId: string): Promise<void> {
-    const bundle = await this.findOneOrFail(bundleId);
-    if (bundle.remainingMessages !== null) {
-      bundle.remainingMessages -= 1;
-      await this.bundles.save(bundle);
+      if (locked.remainingMessages !== null) {
+        locked.remainingMessages -= 1;
+        await bundleRepo.save(locked);
+      }
+      return locked;
     }
+
+    return null;
   }
 }
